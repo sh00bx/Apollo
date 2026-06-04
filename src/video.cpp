@@ -827,9 +827,11 @@ namespace video {
       {
         // SDR-specific options
         {"profile"s, [](const config_t &cfg) {
-           if (cfg.profile == 66) return "baseline"s;
-           if (cfg.profile == 77) return "main"s;
-           return "high"s;
+           // Apollo no longer carries a separate profile_idc in config_t (it
+           // was 66=baseline / 77=main / else=high in the legacy Sunshine
+           // protocol). Modern Moonlight always negotiates High profile;
+           // 4:4:4 chroma flips it to High 4:4:4 Predictive.
+           return cfg.chromaSamplingType == 1 ? "high_444"s : "high"s;
          }},
       },
       {},  // HDR-specific options
