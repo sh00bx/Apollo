@@ -245,6 +245,7 @@ namespace nvenc {
                                                                                             NV_ENC_MULTI_PASS_DISABLED;
 
     enc_config.rcParams.enableAQ = config.adaptive_quantization;
+    enc_config.rcParams.enableTemporalAQ = config.temporal_aq && get_encoder_cap(NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ);
     enc_config.rcParams.averageBitRate = client_config.bitrate * 1000;
 
     if (get_encoder_cap(NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE)) {
@@ -479,6 +480,9 @@ namespace nvenc {
       }
       if (enc_config.rcParams.enableAQ) {
         extra += " spatial-aq";
+      }
+      if (enc_config.rcParams.enableTemporalAQ) {
+        extra += " temporal-aq";
       }
       if (enc_config.rcParams.enableMinQP) {
         extra += std::format(" qpmin={}", enc_config.rcParams.minQP.qpInterP);

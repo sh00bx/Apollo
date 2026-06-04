@@ -1138,6 +1138,7 @@ namespace config {
     int_between_f(vars, "nvenc_preset", video.nv.quality_preset, {1, 7});
     int_between_f(vars, "nvenc_vbv_increase", video.nv.vbv_percentage_increase, {0, 400});
     bool_f(vars, "nvenc_spatial_aq", video.nv.adaptive_quantization);
+    bool_f(vars, "nvenc_temporal_aq", video.nv.temporal_aq);
     bool_f(vars, "nvenc_weighted_prediction", video.nv.weighted_prediction);
     bool_f(vars, "nvenc_min_qp_enable", video.nv.enable_min_qp);
     int_between_f(vars, "nvenc_min_qp_h264", video.nv.min_qp_h264, {0, 51});
