@@ -35,13 +35,13 @@ namespace nvenc {
     bool enable_min_qp = false;
 
     // Min QP value for H.264 when enable_min_qp is selected
-    unsigned min_qp_h264 = 19;
+    int min_qp_h264 = 19;
 
     // Min QP value for HEVC when enable_min_qp is selected
-    unsigned min_qp_hevc = 23;
+    int min_qp_hevc = 23;
 
     // Min QP value for AV1 when enable_min_qp is selected
-    unsigned min_qp_av1 = 23;
+    int min_qp_av1 = 23;
 
     // Use CAVLC entropy coding in H.264 instead of CABAC, not relevant and here for historical reasons
     bool h264_cavlc = false;
