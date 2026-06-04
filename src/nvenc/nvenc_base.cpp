@@ -379,6 +379,29 @@ namespace nvenc {
         }
     }
 
+#if NVENCAPI_MAJOR_VERSION > 12 || (NVENCAPI_MAJOR_VERSION == 12 && NVENCAPI_MINOR_VERSION >= 1)
+    // Split-frame encoding is only available for HEVC (videoFormat == 1) and AV1
+    // (videoFormat == 2), and only on NVENCAPI 12.1+ (added in NVIDIA driver 555+).
+    // Weighted prediction is mutually exclusive with split-frame encoding on HEVC.
+    if (client_config.videoFormat == 1 || client_config.videoFormat == 2) {
+      bool split_blocked_by_wp = (client_config.videoFormat == 1) && init_params.enableWeightedPrediction;
+      if (!split_blocked_by_wp) {
+        switch (config.split_encode) {
+          case nvenc::split_encode_mode::enabled:
+            init_params.splitEncodeMode = NV_ENC_SPLIT_AUTO_FORCED_MODE;
+            break;
+          case nvenc::split_encode_mode::disabled:
+            init_params.splitEncodeMode = NV_ENC_SPLIT_DISABLE_MODE;
+            break;
+          case nvenc::split_encode_mode::auto_mode:
+          default:
+            init_params.splitEncodeMode = NV_ENC_SPLIT_AUTO_MODE;
+            break;
+        }
+      }
+    }
+#endif
+
     init_params.encodeConfig = &enc_config;
 
     if (nvenc_failed(nvenc->nvEncInitializeEncoder(encoder, &init_params))) {

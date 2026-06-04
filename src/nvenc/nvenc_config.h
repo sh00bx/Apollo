@@ -12,12 +12,23 @@ namespace nvenc {
     full_resolution,  ///< Better overall statistics, slower and uses more extra vram
   };
 
+  enum class split_encode_mode {
+    auto_mode,  ///< Let the NVIDIA driver decide when split-frame encoding should be used
+    enabled,  ///< Force split-frame encoding when supported (HEVC/AV1 only, requires NVENCAPI 12.1+)
+    disabled,  ///< Disable split-frame encoding even when the driver would otherwise auto-enable it
+  };
+
   /**
    * @brief NVENC encoder configuration.
    */
   struct nvenc_config {
     // Quality preset from 1 to 7, higher is slower
     int quality_preset = 1;
+
+    // Control split-frame encoding for supported HEVC/AV1 sessions. Lets the NVENC
+    // driver spread one frame across multiple encoder engines (Ada+ dual-NVENC),
+    // reducing per-frame encode latency and adding throughput headroom.
+    split_encode_mode split_encode = split_encode_mode::auto_mode;
 
     // Use optional preliminary pass for better motion vectors, bitrate distribution and stricter VBV(HRD), uses CUDA cores
     nvenc_two_pass two_pass = nvenc_two_pass::quarter_resolution;
