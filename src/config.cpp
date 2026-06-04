@@ -1126,6 +1126,7 @@ namespace config {
     int_between_f(vars, "nvenc_min_qp_h264", video.nv.min_qp_h264, {0, 51});
     int_between_f(vars, "nvenc_min_qp_hevc", video.nv.min_qp_hevc, {0, 51});
     int_between_f(vars, "nvenc_min_qp_av1", video.nv.min_qp_av1, {0, 63});
+    bool_f(vars, "nvenc_insert_filler_data", video.nv.insert_filler_data);
     generic_f(vars, "nvenc_twopass", video.nv.two_pass, nv::twopass_from_view);
     bool_f(vars, "nvenc_h264_cavlc", video.nv.h264_cavlc);
     bool_f(vars, "nvenc_intra_refresh", video.nv.intra_refresh);
