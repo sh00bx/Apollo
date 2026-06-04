@@ -62,6 +62,13 @@ namespace platf {
     void *userdata
   );
 
+  void CALLBACK ds5_notify(
+    client_t::pointer client,
+    target_t::pointer target,
+    DS5_OUTPUT_REPORT /* report */,
+    void *userdata
+  );
+
   struct gp_touch_context_t {
     uint8_t pointerIndex;
     uint16_t x;
@@ -75,6 +82,7 @@ namespace platf {
     union {
       XUSB_REPORT x360;
       DS4_REPORT_EX ds4;
+      DS5_REPORT_EX ds5;
     } report;
 
     // Map from pointer ID to pointer index
@@ -130,6 +138,56 @@ namespace platf {
       .sCurrentTouch = ds4_touch_unused,
       .sPreviousTouch = {ds4_touch_unused, ds4_touch_unused}}}
   };
+
+  // 0x08 = D-pad NONE for the DS5 4-bit hat field (bButtons0 bits[3:0]).
+  constexpr uint8_t DS5_DPAD_NONE = 0x08;
+
+  constexpr DS5_REPORT_EX ds5_report_init_ex = {
+    .Report = {
+      .bThumbLX  = 0x80,
+      .bThumbLY  = 0x80,
+      .bThumbRX  = 0x80,
+      .bThumbRY  = 0x80,
+      .bTriggerL = 0,
+      .bTriggerR = 0,
+      .bSeqNumber = 0,
+      .bButtons0 = DS5_DPAD_NONE,
+      .bButtons1 = 0,
+      .bButtons2 = 0,
+      .bButtons3 = 0,
+      ._reserved = {0, 0, 0, 0},
+      .wGyroX = 0, .wGyroY = 0, .wGyroZ = 0,
+      .wAccelX = 0, .wAccelY = 0, .wAccelZ = 0,
+      .dwSensorTimestamp = 0,
+      ._reserved2 = 0,
+      .sTouch = {{0x80, 0, 0, 0}, {0x80, 0, 0, 0}},  // contact byte bit 7 set = pointer up
+      ._reserved3 = {0,0,0,0,0,0,0,0,0,0,0,0},
+      .bStatus0 = 0x0B,  // USB cable + full battery (0xB nibble == full)
+      .bStatus1 = 0,
+      .bStatus2 = 0,
+      ._reserved4 = {0,0,0,0,0,0,0,0},
+    }
+  };
+
+  /**
+   * @brief Update DS5 motion fields. Same input semantics as ds4_update_motion:
+   *        acceleration in m/s^2, angular velocity in deg/s.
+   */
+  static void ds5_update_motion(gamepad_context_t &gamepad, uint8_t motion_type, float x, float y, float z) {
+    auto &report = gamepad.report.ds5.Report;
+    // DS5 sensor scales follow the same conventions as DS4 (see hid-playstation.c
+    // dualsense_calibration_data): accel raw counts ~8192 LSB/G, gyro ~1024/64
+    // LSB/(deg/s). Using DS4 conversions is correct after calibration normalization.
+    if (motion_type == LI_MOTION_TYPE_ACCEL) {
+      report.wAccelX = (int16_t) MPS2_TO_DS4_ACCEL(x);
+      report.wAccelY = (int16_t) MPS2_TO_DS4_ACCEL(y);
+      report.wAccelZ = (int16_t) MPS2_TO_DS4_ACCEL(z);
+    } else if (motion_type == LI_MOTION_TYPE_GYRO) {
+      report.wGyroX = (int16_t) DPS_TO_DS4_GYRO(x);
+      report.wGyroY = (int16_t) DPS_TO_DS4_GYRO(y);
+      report.wGyroZ = (int16_t) DPS_TO_DS4_GYRO(z);
+    }
+  }
 
   /**
    * @brief Updates the DS4 input report with the provided motion data.
@@ -244,6 +302,18 @@ namespace platf {
       if (gp_type == Xbox360Wired) {
         gamepad.gp.reset(vigem_target_x360_alloc());
         XUSB_REPORT_INIT(&gamepad.report.x360);
+      } else if (gp_type == DualSense5Wired) {
+        gamepad.gp.reset(vigem_target_ds5_alloc());
+        gamepad.report.ds5 = ds5_report_init_ex;
+
+        ds5_update_motion(gamepad, LI_MOTION_TYPE_ACCEL, 0.0f, EARTH_G, 0.0f);
+        ds5_update_motion(gamepad, LI_MOTION_TYPE_GYRO, 0.0f, 0.0f, 0.0f);
+
+        feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_ACCEL, 100));
+        feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_GYRO, 100));
+
+        // Touch wiring deferred to a follow-up patch — keep both pointers unavailable for now.
+        gamepad.available_pointers = 0x0;
       } else {
         gamepad.gp.reset(vigem_target_ds4_alloc());
 
@@ -273,6 +343,8 @@ namespace platf {
 
       if (gp_type == Xbox360Wired) {
         status = vigem_target_x360_register_notification(client.get(), gamepad.gp.get(), x360_notify, this);
+      } else if (gp_type == DualSense5Wired) {
+        status = vigem_target_ds5_register_notification(client.get(), gamepad.gp.get(), ds5_notify, this);
       } else {
         status = vigem_target_ds4_register_notification(client.get(), gamepad.gp.get(), ds4_notify, this);
       }
@@ -438,6 +510,54 @@ namespace platf {
 
     task_pool.push(&vigem_t::rumble, (vigem_t *) userdata, target, largeMotor, smallMotor);
     task_pool.push(&vigem_t::set_rgb_led, (vigem_t *) userdata, target, led_color.Red, led_color.Green, led_color.Blue);
+  }
+
+  /**
+   * @brief Callback invoked when the virtual DualSense receives an output report
+   *        from the host application (game). Extracts rumble, lightbar and
+   *        per-trigger adaptive-trigger config, posts them as feedback messages
+   *        for the client (Moonlight-TV) to apply to the real DualSense via
+   *        SDL_hid_write.
+   */
+  void CALLBACK ds5_notify(
+    client_t::pointer client,
+    target_t::pointer target,
+    DS5_OUTPUT_REPORT report,
+    void *userdata
+  ) {
+    auto vigem = (vigem_t *) userdata;
+
+    task_pool.push(&vigem_t::rumble, vigem, target, report.LargeMotor, report.SmallMotor);
+    task_pool.push(&vigem_t::set_rgb_led, vigem, target,
+                   report.LightbarColor.Red, report.LightbarColor.Green, report.LightbarColor.Blue);
+
+    // Find the gamepad context to get the client_relative_index for the feedback message.
+    for (int i = 0; i < (int) vigem->gamepads.size(); ++i) {
+      auto &g = vigem->gamepads[i];
+      if (g.gp.get() != target) continue;
+
+      // DS5 trigger config from ViGEmBus output report is Mode + Param[7] per
+      // side. Moonlight's adaptive-trigger control message carries the mode
+      // separately (type_left/type_right) plus a 10-byte param array (matching
+      // the DualSense USB output report's right_trigger_param[10] layout).
+      // Pack the 7 ViGEmBus param bytes into the first 7 positions; remaining
+      // bytes stay zero (DS5 reads zero-padded trailing params as "no extra
+      // params" for the simpler trigger modes).
+      std::array<uint8_t, 10> left {};
+      std::array<uint8_t, 10> right {};
+      memcpy(left.data(),  report.LeftTrigger.Param,  sizeof(report.LeftTrigger.Param));
+      memcpy(right.data(), report.RightTrigger.Param, sizeof(report.RightTrigger.Param));
+
+      // event_flags = which side(s) changed. DS_EFFECT_RIGHT_TRIGGER (0x04) +
+      // DS_EFFECT_LEFT_TRIGGER (0x08). Always set both for now — we don't track
+      // previous state and the client can dedupe further down.
+      const uint8_t event_flags = 0x0C;
+      g.feedback_queue->raise(gamepad_feedback_msg_t::make_adaptive_triggers(
+        g.client_relative_index, event_flags,
+        report.LeftTrigger.Mode, report.RightTrigger.Mode,
+        left, right));
+      return;
+    }
   }
 
   struct input_raw_t {
@@ -1187,6 +1307,9 @@ namespace platf {
     } else if (config::input.gamepad == "ds4"sv) {
       BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (manual selection)"sv;
       selectedGamepadType = DualShock4Wired;
+    } else if (config::input.gamepad == "ds5"sv) {
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualSense 5 controller (manual selection)"sv;
+      selectedGamepadType = DualSense5Wired;
     } else if (metadata.type == LI_CTYPE_PS) {
       BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (auto-selected by client-reported type)"sv;
       selectedGamepadType = DualShock4Wired;
@@ -1221,6 +1344,13 @@ namespace platf {
       if (!(metadata.capabilities & LI_CCAP_TOUCHPAD)) {
         BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " is emulating a DualShock 4 controller, but the client gamepad doesn't have a touchpad"sv;
       }
+    } else if (selectedGamepadType == DualSense5Wired) {
+      if (!(metadata.capabilities & (LI_CCAP_ACCEL | LI_CCAP_GYRO))) {
+        BOOST_LOG(warning) << "Gamepad " << id.globalIndex << " is emulating a DualSense 5 controller, but the client gamepad doesn't have motion sensors active"sv;
+      }
+      // Touchpad/adaptive-trigger forwarding from client to virtual DS5 is wired only as far as
+      // the feedback queue; the client (Moonlight-TV) needs the matching E4 patch to actually
+      // apply trigger configs and forward touch events to the real DualSense.
     }
 
     return raw->vigem->alloc_gamepad_internal(id, feedback_queue, selectedGamepadType);
@@ -1480,6 +1610,101 @@ namespace platf {
     }
   }
 
+  /** D-pad value in the 4-bit field DS5 uses (bButtons0 bits[3:0]). */
+  static uint8_t ds5_dpad_value(const gamepad_state_t &gamepad_state) {
+    auto f = gamepad_state.buttonFlags;
+    if (f & DPAD_UP) {
+      if (f & DPAD_RIGHT) return 1;  // NE
+      if (f & DPAD_LEFT)  return 7;  // NW
+      return 0;                       // N
+    }
+    if (f & DPAD_DOWN) {
+      if (f & DPAD_RIGHT) return 3;  // SE
+      if (f & DPAD_LEFT)  return 5;  // SW
+      return 4;                       // S
+    }
+    if (f & DPAD_RIGHT) return 2;    // E
+    if (f & DPAD_LEFT)  return 6;    // W
+    return DS5_DPAD_NONE;             // released
+  }
+
+  /** Pack face / shoulder / system buttons into the three DS5 bButtons{0,1,2} bytes. */
+  static void ds5_pack_buttons(const gamepad_state_t &gamepad_state,
+                               uint8_t &b0, uint8_t &b1, uint8_t &b2) {
+    auto f = gamepad_state.buttonFlags;
+    b0 = ds5_dpad_value(gamepad_state);
+    if (f & X)            b0 |= 0x10;  // Square
+    if (f & A)            b0 |= 0x20;  // Cross
+    if (f & B)            b0 |= 0x40;  // Circle
+    if (f & Y)            b0 |= 0x80;  // Triangle
+
+    b1 = 0;
+    if (f & LEFT_BUTTON)  b1 |= 0x01;  // L1
+    if (f & RIGHT_BUTTON) b1 |= 0x02;  // R1
+    if (gamepad_state.lt > 0) b1 |= 0x04;  // L2 (analog → digital flag)
+    if (gamepad_state.rt > 0) b1 |= 0x08;  // R2
+    if (f & BACK)         b1 |= 0x10;  // Create (Share)
+    if (f & START)        b1 |= 0x20;  // Options
+    if (f & LEFT_STICK)   b1 |= 0x40;  // L3
+    if (f & RIGHT_STICK)  b1 |= 0x80;  // R3
+
+    b2 = 0;
+    if (f & HOME)             b2 |= 0x01;  // PS
+    if (f & TOUCHPAD_BUTTON)  b2 |= 0x02;  // Touchpad click
+    if (f & MISC_BUTTON)      b2 |= 0x04;  // Mic mute
+  }
+
+  static void ds5_update_state(gamepad_context_t &gamepad, const gamepad_state_t &gamepad_state) {
+    auto &report = gamepad.report.ds5.Report;
+
+    uint8_t b0, b1, b2;
+    ds5_pack_buttons(gamepad_state, b0, b1, b2);
+    report.bButtons0 = b0;
+    report.bButtons1 = b1;
+    report.bButtons2 = b2;
+
+    report.bTriggerL = gamepad_state.lt;
+    report.bTriggerR = gamepad_state.rt;
+
+    report.bThumbLX = to_ds4_triggerX(gamepad_state.lsX);
+    report.bThumbLY = to_ds4_triggerY(gamepad_state.lsY);
+    report.bThumbRX = to_ds4_triggerX(gamepad_state.rsX);
+    report.bThumbRY = to_ds4_triggerY(gamepad_state.rsY);
+
+    report.bSeqNumber++;
+  }
+
+  /**
+   * @brief DS5 equivalent of ds4_update_ts_and_send. Uses 32-bit dwSensorTimestamp
+   *        and 100-ms repeat to keep the report fresh — apps that watch the
+   *        timestamp field need a continuous stream.
+   */
+  void ds5_update_ts_and_send(vigem_t *vigem, int nr) {
+    auto &gamepad = vigem->gamepads[nr];
+
+    if (gamepad.repeat_task) {
+      task_pool.cancel(gamepad.repeat_task);
+      gamepad.repeat_task = nullptr;
+    }
+
+    if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
+      auto now = std::chrono::steady_clock::now();
+      auto delta_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - gamepad.last_report_ts);
+
+      // DualSense sensor timestamp ticks at 0.33µs per LSB (3 MHz). 1 ns = 1/333.33 ticks.
+      gamepad.report.ds5.Report.dwSensorTimestamp += (uint32_t) (delta_ns.count() * 3 / 1000);
+
+      auto status = vigem_target_ds5_update_ex(vigem->client.get(), gamepad.gp.get(), gamepad.report.ds5);
+      if (!VIGEM_SUCCESS(status)) {
+        BOOST_LOG(warning) << "Couldn't send DS5 gamepad input to ViGEm ["sv << util::hex(status).to_string_view() << ']';
+        return;
+      }
+
+      gamepad.last_report_ts = now;
+      gamepad.repeat_task = task_pool.pushDelayed(ds5_update_ts_and_send, 100ms, vigem, nr).task_id;
+    }
+  }
+
   /**
    * @brief Updates virtual gamepad with the provided gamepad state.
    * @param input The input context.
@@ -1500,13 +1725,17 @@ namespace platf {
     }
 
     VIGEM_ERROR status;
+    auto target_type = vigem_target_get_type(gamepad.gp.get());
 
-    if (vigem_target_get_type(gamepad.gp.get()) == Xbox360Wired) {
+    if (target_type == Xbox360Wired) {
       x360_update_state(gamepad, gamepad_state);
       status = vigem_target_x360_update(vigem->client.get(), gamepad.gp.get(), gamepad.report.x360);
       if (!VIGEM_SUCCESS(status)) {
         BOOST_LOG(warning) << "Couldn't send gamepad input to ViGEm ["sv << util::hex(status).to_string_view() << ']';
       }
+    } else if (target_type == DualSense5Wired) {
+      ds5_update_state(gamepad, gamepad_state);
+      ds5_update_ts_and_send(vigem, nr);
     } else {
       ds4_update_state(gamepad, gamepad_state);
       ds4_update_ts_and_send(vigem, nr);
@@ -1637,13 +1866,15 @@ namespace platf {
       return;
     }
 
-    // Motion is only supported on DualShock 4 controllers
-    if (vigem_target_get_type(gamepad.gp.get()) != DualShock4Wired) {
-      return;
+    auto target_type = vigem_target_get_type(gamepad.gp.get());
+    if (target_type == DualShock4Wired) {
+      ds4_update_motion(gamepad, motion.motionType, motion.x, motion.y, motion.z);
+      ds4_update_ts_and_send(vigem, motion.id.globalIndex);
+    } else if (target_type == DualSense5Wired) {
+      ds5_update_motion(gamepad, motion.motionType, motion.x, motion.y, motion.z);
+      ds5_update_ts_and_send(vigem, motion.id.globalIndex);
     }
-
-    ds4_update_motion(gamepad, motion.motionType, motion.x, motion.y, motion.z);
-    ds4_update_ts_and_send(vigem, motion.id.globalIndex);
+    // Motion is unsupported on Xbox 360 emulation.
   }
 
   /**
@@ -1731,6 +1962,7 @@ namespace platf {
         supported_gamepad_t {"auto", true, ""},
         supported_gamepad_t {"x360", false, ""},
         supported_gamepad_t {"ds4", false, ""},
+        supported_gamepad_t {"ds5", false, ""},
       };
 
       return gps;
@@ -1740,11 +1972,12 @@ namespace platf {
     auto enabled = vigem != nullptr;
     auto reason = enabled ? "" : "gamepads.vigem-not-available";
 
-    // ds4 == ps4
+    // ds4 == ps4 / ds5 == ps5
     static std::vector gps {
       supported_gamepad_t {"auto", true, reason},
       supported_gamepad_t {"x360", enabled, reason},
-      supported_gamepad_t {"ds4", enabled, reason}
+      supported_gamepad_t {"ds4", enabled, reason},
+      supported_gamepad_t {"ds5", enabled, reason},
     };
 
     for (auto &[name, is_enabled, reason_disabled] : gps) {
