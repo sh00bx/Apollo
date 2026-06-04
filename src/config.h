@@ -174,6 +174,12 @@ namespace config {
     // Video encryption settings for LAN and WAN streams
     int lan_encryption_mode;
     int wan_encryption_mode;
+
+    // Cap the RTP send pacer (kbps). 0 = legacy ~80% of 1 Gbps assumption,
+    // which collapses to no-op on a slower WiFi link. Set to ~1.3x stream
+    // bitrate when streaming over WiFi to spread the per-frame burst across
+    // the full frame slot.
+    int pacing_max_bitrate_kbps;
   };
 
   struct nvhttp_t {

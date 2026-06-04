@@ -1460,8 +1460,24 @@ namespace stream {
       }
 
       try {
-        // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
-        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+        // Pacing target: legacy default targets ~80% of 1 Gbps (Ethernet).
+        // On WiFi links the legacy value collapses to a no-op pacer (frames
+        // get blasted out faster than the link can absorb, then idle), which
+        // amplifies AMPDU-aggregation jitter on the client. If the operator
+        // sets `pacing_max_bitrate_kbps` we honor it; otherwise keep legacy.
+        size_t pacing_bps;
+        if (config::stream.pacing_max_bitrate_kbps > 0) {
+          pacing_bps = (size_t) config::stream.pacing_max_bitrate_kbps * 1000ull;
+        } else {
+          pacing_bps = (size_t) (std::giga::num * 80 / 100);  // 80% of 1 Gbps
+        }
+        //                                          bps    ms    packet      byte
+        size_t ratecontrol_packets_in_1ms = pacing_bps / 1000 / blocksize / 8;
+        if (ratecontrol_packets_in_1ms == 0) {
+          // Floor at one packet/ms so the inner sleep loop never divides by zero
+          // and we still send something on absurdly low bitrate caps.
+          ratecontrol_packets_in_1ms = 1;
+        }
 
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
