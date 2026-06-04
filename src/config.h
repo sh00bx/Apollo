@@ -16,6 +16,12 @@
 #include "nvenc/nvenc_config.h"
 
 namespace config {
+  // Valid range for the packetsize limit
+  constexpr int PACKETSIZE_MIN = 200;
+  constexpr int PACKETSIZE_MAX = 65535;
+  constexpr int PACKETSIZE_SMALL = 500;
+  constexpr int PACKETSIZE_LARGE = 1456;
+
   // track modified config options
   inline std::unordered_map<std::string, std::string> modified_config_settings;
 
@@ -180,6 +186,9 @@ namespace config {
     // bitrate when streaming over WiFi to spread the per-frame burst across
     // the full frame slot.
     int pacing_max_bitrate_kbps;
+
+    // Limit the packetsize to avoid fragmentation on a low MTU link
+    int packetsize;
   };
 
   struct nvhttp_t {
