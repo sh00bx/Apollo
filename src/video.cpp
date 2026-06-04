@@ -2355,8 +2355,12 @@ namespace video {
       }
     });
 
-    // Encoding and capture takes place on this thread
-    platf::adjust_thread_priority(platf::thread_priority_e::high);
+    // Encoding and capture takes place on this thread. Late frames here turn
+    // into late hand-offs to the broadcast thread, which in turn produce the
+    // burst-then-idle pattern the AP1 pacer is meant to absorb. Run at
+    // critical so neither encode nor capture lose timing slices to background
+    // work.
+    platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
     std::vector<std::string> display_names;
     int display_p = -1;
@@ -2392,8 +2396,11 @@ namespace video {
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
 
-    // Encoding takes place on this thread
-    platf::adjust_thread_priority(platf::thread_priority_e::high);
+    // Encoding takes place on this thread (async-capture mode, capture lives
+    // in capture_thread_async at critical already). Upgrade encode to match
+    // so neither half of the pipeline stalls the other on a scheduler
+    // quantum.
+    platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
     while (!shutdown_event->peek() && images->running()) {
       // Wait for the main capture event when the display is being reinitialized

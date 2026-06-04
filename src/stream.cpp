@@ -1329,8 +1329,12 @@ namespace stream {
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
     auto video_epoch = std::chrono::steady_clock::now();
 
-    // Video traffic is sent on this thread
-    platf::adjust_thread_priority(platf::thread_priority_e::high);
+    // Video traffic is sent on this thread. The AP1 send pacer relies on this
+    // thread waking up on its sleep deadlines; if Windows preempts us for the
+    // next scheduler quantum (10-20 ms) the per-frame burst pattern returns,
+    // which is exactly what the pacer is supposed to prevent. Upgrade to
+    // critical so the broadcast thread runs above generic background work.
+    platf::adjust_thread_priority(platf::thread_priority_e::critical);
 
     logging::min_max_avg_periodic_logger<double> frame_processing_latency_logger(debug, "Frame processing latency", "ms");
 
