@@ -8,13 +8,20 @@
 #include <Windows.h>
 
 // standard includes
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstring>
+#include <memory>
+#include <string>
 #include <thread>
+#include <vector>
 
 // lib includes
 #include <ViGEm/Client.h>
 
 // local includes
+#include "ds5_usbip_server.h"
 #include "keylayout.h"
 #include "misc.h"
 #include "src/config.h"
@@ -62,12 +69,8 @@ namespace platf {
     void *userdata
   );
 
-  void CALLBACK ds5_notify(
-    client_t::pointer client,
-    target_t::pointer target,
-    DS5_OUTPUT_REPORT /* report */,
-    void *userdata
-  );
+  // DS5 no longer uses a ViGEm rumble callback: it is driven by ds5vhid via a
+  // feature-report poll thread (see vigem_t::ds5_output_poll). No forward decl.
 
   struct gp_touch_context_t {
     uint8_t pointerIndex;
@@ -77,6 +80,9 @@ namespace platf {
 
   struct gamepad_context_t {
     target_t gp;
+    // Emulated type. For DualSense5Wired the transport is ds5vhid (gp is null), so
+    // dispatch must key off this field, NOT vigem_target_get_type(gp).
+    VIGEM_TARGET_TYPE type {};
     feedback_queue_t feedback_queue;
 
     union {
@@ -96,6 +102,14 @@ namespace platf {
 
     gamepad_feedback_msg_t last_rumble;
     gamepad_feedback_msg_t last_rgb_led;
+
+    // Current DS5 adaptive-trigger effect actually programmed on the controller,
+    // maintained across reports ([0]=mode, [1..10]=params). Only the trigger whose
+    // valid-flag bit is set in valid_flag0 (0x04 right, 0x08 left) is updated by a
+    // given report, so a rumble-only report (trigger bytes zeroed, no flag) can't
+    // clobber an engaged effect and make it release/re-engage every frame.
+    uint8_t cur_rtrig[11] {};
+    uint8_t cur_ltrig[11] {};
   };
 
   constexpr float EARTH_G = 9.80665f;
@@ -285,6 +299,14 @@ namespace platf {
 
       gamepad.client_relative_index = id.clientRelativeIndex;
       gamepad.last_report_ts = std::chrono::steady_clock::now();
+      gamepad.type = gp_type;
+
+      // DualSense is emulated by our own ds5vhid UMDF driver, NOT ViGEmBus (no DS5
+      // PDO there, and the kernel-fork is unusable under Secure Boot). Handle it
+      // entirely here so DS5 doesn't even require ViGEmBus to be installed.
+      if (gp_type == DualSense5Wired) {
+        return alloc_ds5vhid(id.globalIndex, feedback_queue);
+      }
 
       // Establish a connect to the ViGEm driver if we don't have one yet
       if (!client) {
@@ -302,18 +324,6 @@ namespace platf {
       if (gp_type == Xbox360Wired) {
         gamepad.gp.reset(vigem_target_x360_alloc());
         XUSB_REPORT_INIT(&gamepad.report.x360);
-      } else if (gp_type == DualSense5Wired) {
-        gamepad.gp.reset(vigem_target_ds5_alloc());
-        gamepad.report.ds5 = ds5_report_init_ex;
-
-        ds5_update_motion(gamepad, LI_MOTION_TYPE_ACCEL, 0.0f, EARTH_G, 0.0f);
-        ds5_update_motion(gamepad, LI_MOTION_TYPE_GYRO, 0.0f, 0.0f, 0.0f);
-
-        feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_ACCEL, 100));
-        feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_GYRO, 100));
-
-        // Touch wiring deferred to a follow-up patch — keep both pointers unavailable for now.
-        gamepad.available_pointers = 0x0;
       } else {
         gamepad.gp.reset(vigem_target_ds4_alloc());
 
@@ -343,8 +353,6 @@ namespace platf {
 
       if (gp_type == Xbox360Wired) {
         status = vigem_target_x360_register_notification(client.get(), gamepad.gp.get(), x360_notify, this);
-      } else if (gp_type == DualSense5Wired) {
-        status = vigem_target_ds5_register_notification(client.get(), gamepad.gp.get(), ds5_notify, this);
       } else {
         status = vigem_target_ds4_register_notification(client.get(), gamepad.gp.get(), ds4_notify, this);
       }
@@ -357,6 +365,200 @@ namespace platf {
     }
 
     /**
+     * @brief Allocate a DualSense backed by the ds5vhid virtual-HID driver.
+     *        Lazily opens the (single) device + starts the output poll thread.
+     * @return 0 on success, -1 if the ds5vhid driver isn't installed.
+     */
+    /**
+     * @brief Ensure the usbip-win2 vhci client is attached to our embedded server.
+     *
+     * Runs on a detached thread: `usbip attach` performs a synchronous USB/IP
+     * import handshake against our just-started listener, so doing it inline would
+     * deadlock (the caller would block before accept_loop could answer). Idempotent
+     * — a `cmd` one-liner attaches only if no 054c:0ce6 port already exists, so
+     * restarting the server every stream session never stacks duplicate controllers
+     * (and an already-reconnected vhci port is left alone). Best-effort: if usbip
+     * isn't found the user can still attach manually.
+     */
+    static void ds5_ensure_attached() {
+      std::thread([] {
+        using namespace std::chrono_literals;
+        // Give the server's accept loop a moment to reach accept().
+        std::this_thread::sleep_for(400ms);
+
+        static const char *const candidates[] = {
+          "C:\\Program Files\\USBip\\usbip.exe",
+          "C:\\Program Files\\usbip-win2\\usbip.exe",
+          "C:\\Program Files (x86)\\USBip\\usbip.exe",
+        };
+        std::string exe;
+        for (auto *c : candidates) {
+          if (GetFileAttributesA(c) != INVALID_FILE_ATTRIBUTES) {
+            exe = c;
+            break;
+          }
+        }
+        if (exe.empty()) {
+          exe = "usbip.exe";  // fall back to PATH
+        }
+
+        // Attach only when no existing 054c:0ce6 vhci port is present (findstr sets
+        // errorlevel 0 on a match → `||` skips the attach).
+        std::string cmd = "cmd.exe /c \"\"" + exe + "\" port | findstr /i 0ce6 >nul || \"" +
+                          exe + "\" attach -r 127.0.0.1 -b 1-1\"";
+
+        STARTUPINFOA si {};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi {};
+        std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+        mutable_cmd.push_back('\0');
+        if (CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE,
+                           CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+          WaitForSingleObject(pi.hProcess, 8000);
+          DWORD code = 0;
+          GetExitCodeProcess(pi.hProcess, &code);
+          CloseHandle(pi.hProcess);
+          CloseHandle(pi.hThread);
+          BOOST_LOG(info) << "ds5usbip: auto-attach helper done (exit "sv << code << ")"sv;
+        } else {
+          BOOST_LOG(warning) << "ds5usbip: could not launch usbip auto-attach helper (attach manually: usbip attach -r 127.0.0.1 -b 1-1)"sv;
+        }
+      }).detach();
+    }
+
+    int alloc_ds5vhid(int nr, feedback_queue_t &feedback_queue) {
+      auto &gamepad = gamepads[nr];
+
+      gamepad.report.ds5 = ds5_report_init_ex;
+      ds5_update_motion(gamepad, LI_MOTION_TYPE_ACCEL, 0.0f, EARTH_G, 0.0f);
+      ds5_update_motion(gamepad, LI_MOTION_TYPE_GYRO, 0.0f, 0.0f, 0.0f);
+      feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_ACCEL, 100));
+      feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(gamepad.client_relative_index, LI_MOTION_TYPE_GYRO, 100));
+      gamepad.available_pointers = 0x0;  // touch deferred (Phase E)
+
+      // One embedded USB/IP server hosts the (single) virtual DualSense. The
+      // Microsoft-signed usbip-win2 vhci attaches to it on 127.0.0.1:3240, so the
+      // controller enumerates as a genuine USB device (strict games then accept
+      // its output). The game's output reports arrive via the callback below.
+      if (!ds5_server) {
+        ds5_server = std::make_unique<ds5usbip::server_t>();
+        if (!ds5_server->start([this](const uint8_t *payload) { ds5_on_output(payload); })) {
+          BOOST_LOG(error) << "ds5usbip: could not start USB/IP server on 127.0.0.1:3240 (already running?)."sv;
+          ds5_server.reset();
+          return -1;
+        }
+        BOOST_LOG(info) << "ds5usbip: USB/IP server up on 127.0.0.1:3240 — auto-attaching vhci"sv;
+        ds5_ensure_attached();
+      }
+
+      gamepad.feedback_queue = std::move(feedback_queue);
+      ds5_gamepad_nr = nr;
+      return 0;
+    }
+
+    /**
+     * @brief Parse a raw 47-byte DS5 output-report body (report 0x02 effects state,
+     *        no leading report-ID) into the structured DS5_OUTPUT_REPORT. Offsets
+     *        mirror the ViGEmBus Ds5Pdo parser, shifted -1 (our buffer omits the ID).
+     */
+    static void parse_ds5_output(const uint8_t *eff, DS5_OUTPUT_REPORT &out) {
+      memset(&out, 0, sizeof(out));
+      out.SmallMotor = eff[2];  // ucRumbleRight
+      out.LargeMotor = eff[3];  // ucRumbleLeft
+      out.RightTrigger.Mode = eff[10];
+      memcpy(out.RightTrigger.Param, &eff[11], sizeof(out.RightTrigger.Param));
+      out.LeftTrigger.Mode = eff[21];
+      memcpy(out.LeftTrigger.Param, &eff[22], sizeof(out.LeftTrigger.Param));
+      out.LightbarColor.Red = eff[44];
+      out.LightbarColor.Green = eff[45];
+      out.LightbarColor.Blue = eff[46];
+      out.ValidFlags = (USHORT) (((USHORT) eff[1] << 8) | eff[0]);
+    }
+
+    /**
+     * @brief Turn a parsed DS5 output report into feedback messages for the client
+     *        (rumble / RGB / adaptive triggers). Replacement for the old ds5_notify
+     *        ViGEm callback; addressed by gamepad index, not a ViGEm target pointer.
+     */
+    void ds5_dispatch_output(int nr, const DS5_OUTPUT_REPORT &report, const uint8_t *eff) {
+      auto &gamepad = gamepads[nr];
+      if (!gamepad.feedback_queue) {
+        return;
+      }
+
+      if (config::input.forward_rumble) {
+        // Scale 8-bit motor to full 16-bit range (0xFF -> 0xFFFF, not 0xFF00) by
+        // bit-replication, so peak rumble reaches the client's true maximum.
+        uint16_t large = (uint16_t) ((report.LargeMotor << 8) | report.LargeMotor);
+        uint16_t small = (uint16_t) ((report.SmallMotor << 8) | report.SmallMotor);
+        if (small != gamepad.last_rumble.data.rumble.highfreq ||
+            large != gamepad.last_rumble.data.rumble.lowfreq) {
+          auto msg = gamepad_feedback_msg_t::make_rumble(gamepad.client_relative_index, large, small);
+          gamepad.feedback_queue->raise(msg);
+          gamepad.last_rumble = msg;
+        }
+      }
+
+      {
+        uint8_t r = report.LightbarColor.Red, g = report.LightbarColor.Green, b = report.LightbarColor.Blue;
+        if (r != gamepad.last_rgb_led.data.rgb_led.r ||
+            g != gamepad.last_rgb_led.data.rgb_led.g ||
+            b != gamepad.last_rgb_led.data.rgb_led.b) {
+          auto msg = gamepad_feedback_msg_t::make_rgb_led(gamepad.client_relative_index, r, g, b);
+          gamepad.feedback_queue->raise(msg);
+          gamepad.last_rgb_led = msg;
+        }
+      }
+
+      // Adaptive triggers — a DS5 trigger effect is Mode + 10 param bytes (right at
+      // eff[10..20], left at eff[21..31]). valid_flag0 (eff[0]) says which trigger(s)
+      // THIS report actually programs: 0x04 = right, 0x08 = left. Rumble-only reports
+      // carry zeroed trigger bytes WITHOUT these bits — honoring the flags is what
+      // keeps an engaged effect from being released ("mushy") on every rumble frame.
+      // We maintain the live per-trigger state and forward only on a real change.
+      uint8_t vf0 = eff[0];
+      bool trig_changed = false;
+      if ((vf0 & 0x04) && memcmp(gamepad.cur_rtrig, &eff[10], 11) != 0) {
+        memcpy(gamepad.cur_rtrig, &eff[10], 11);
+        trig_changed = true;
+      }
+      if ((vf0 & 0x08) && memcmp(gamepad.cur_ltrig, &eff[21], 11) != 0) {
+        memcpy(gamepad.cur_ltrig, &eff[21], 11);
+        trig_changed = true;
+      }
+      if (trig_changed) {
+        std::array<uint8_t, 10> left {};
+        std::array<uint8_t, 10> right {};
+        memcpy(right.data(), &gamepad.cur_rtrig[1], 10);
+        memcpy(left.data(), &gamepad.cur_ltrig[1], 10);
+        const uint8_t event_flags = 0x0C;  // DS_EFFECT_LEFT_TRIGGER | DS_EFFECT_RIGHT_TRIGGER
+        gamepad.feedback_queue->raise(gamepad_feedback_msg_t::make_adaptive_triggers(
+          gamepad.client_relative_index, event_flags,
+          gamepad.cur_ltrig[0], gamepad.cur_rtrig[0], left, right));
+      }
+    }
+
+    /**
+     * @brief Output-report callback from the embedded USB/IP server (server thread):
+     *        the game wrote a 47-byte DS5 effects payload (0x02 body, no report-ID).
+     *        Parse + dispatch to the active gamepad's feedback queue, on change only.
+     */
+    void ds5_on_output(const uint8_t *eff) {
+      int nr = ds5_gamepad_nr;
+      if (nr < 0) {
+        return;
+      }
+      if (ds5_have_last_output && memcmp(eff, ds5_last_output, ds5usbip::OUTPUT_PAYLOAD_LEN) == 0) {
+        return;
+      }
+      memcpy(ds5_last_output, eff, ds5usbip::OUTPUT_PAYLOAD_LEN);
+      ds5_have_last_output = true;
+      DS5_OUTPUT_REPORT report;
+      parse_ds5_output(eff, report);
+      ds5_dispatch_output(nr, report, eff);
+    }
+
+    /**
      * @brief Detaches the specified gamepad
      * @param nr The gamepad.
      */
@@ -366,6 +568,15 @@ namespace platf {
       if (gamepad.repeat_task) {
         task_pool.cancel(gamepad.repeat_task);
         gamepad.repeat_task = nullptr;
+      }
+
+      // DS5 (usbip): tear down the embedded USB/IP server. No ViGEm target.
+      if (nr == ds5_gamepad_nr) {
+        ds5_server.reset();
+        ds5_have_last_output = false;
+        ds5_gamepad_nr = -1;
+        gamepad.feedback_queue.reset();
+        return;
       }
 
       if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
@@ -459,6 +670,9 @@ namespace platf {
      * @brief vigem_t destructor.
      */
     ~vigem_t() {
+      // Stop the embedded USB/IP server (joins its threads) before teardown.
+      ds5_server.reset();
+
       if (client) {
         for (auto &gamepad : gamepads) {
           if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
@@ -476,6 +690,12 @@ namespace platf {
     std::vector<gamepad_context_t> gamepads;
 
     client_t client;
+
+    // DualSense via an embedded USB/IP server (one virtual device per process).
+    std::unique_ptr<ds5usbip::server_t> ds5_server;
+    int ds5_gamepad_nr = -1;  // index of the active DS5 gamepad, or -1
+    uint8_t ds5_last_output[ds5usbip::OUTPUT_PAYLOAD_LEN] {};
+    bool ds5_have_last_output = false;
   };
 
   void CALLBACK x360_notify(
@@ -512,53 +732,8 @@ namespace platf {
     task_pool.push(&vigem_t::set_rgb_led, (vigem_t *) userdata, target, led_color.Red, led_color.Green, led_color.Blue);
   }
 
-  /**
-   * @brief Callback invoked when the virtual DualSense receives an output report
-   *        from the host application (game). Extracts rumble, lightbar and
-   *        per-trigger adaptive-trigger config, posts them as feedback messages
-   *        for the client (Moonlight-TV) to apply to the real DualSense via
-   *        SDL_hid_write.
-   */
-  void CALLBACK ds5_notify(
-    client_t::pointer client,
-    target_t::pointer target,
-    DS5_OUTPUT_REPORT report,
-    void *userdata
-  ) {
-    auto vigem = (vigem_t *) userdata;
-
-    task_pool.push(&vigem_t::rumble, vigem, target, report.LargeMotor, report.SmallMotor);
-    task_pool.push(&vigem_t::set_rgb_led, vigem, target,
-                   report.LightbarColor.Red, report.LightbarColor.Green, report.LightbarColor.Blue);
-
-    // Find the gamepad context to get the client_relative_index for the feedback message.
-    for (int i = 0; i < (int) vigem->gamepads.size(); ++i) {
-      auto &g = vigem->gamepads[i];
-      if (g.gp.get() != target) continue;
-
-      // DS5 trigger config from ViGEmBus output report is Mode + Param[7] per
-      // side. Moonlight's adaptive-trigger control message carries the mode
-      // separately (type_left/type_right) plus a 10-byte param array (matching
-      // the DualSense USB output report's right_trigger_param[10] layout).
-      // Pack the 7 ViGEmBus param bytes into the first 7 positions; remaining
-      // bytes stay zero (DS5 reads zero-padded trailing params as "no extra
-      // params" for the simpler trigger modes).
-      std::array<uint8_t, 10> left {};
-      std::array<uint8_t, 10> right {};
-      memcpy(left.data(),  report.LeftTrigger.Param,  sizeof(report.LeftTrigger.Param));
-      memcpy(right.data(), report.RightTrigger.Param, sizeof(report.RightTrigger.Param));
-
-      // event_flags = which side(s) changed. DS_EFFECT_RIGHT_TRIGGER (0x04) +
-      // DS_EFFECT_LEFT_TRIGGER (0x08). Always set both for now — we don't track
-      // previous state and the client can dedupe further down.
-      const uint8_t event_flags = 0x0C;
-      g.feedback_queue->raise(gamepad_feedback_msg_t::make_adaptive_triggers(
-        g.client_relative_index, event_flags,
-        report.LeftTrigger.Mode, report.RightTrigger.Mode,
-        left, right));
-      return;
-    }
-  }
+  // (DS5 output handling moved to vigem_t::ds5_output_poll / ds5_dispatch_output —
+  //  driven by the ds5vhid feature-report poll, not a ViGEm rumble callback.)
 
   struct input_raw_t {
     ~input_raw_t() {
@@ -1311,8 +1486,12 @@ namespace platf {
       BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualSense 5 controller (manual selection)"sv;
       selectedGamepadType = DualSense5Wired;
     } else if (metadata.type == LI_CTYPE_PS) {
-      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualShock 4 controller (auto-selected by client-reported type)"sv;
-      selectedGamepadType = DualShock4Wired;
+      // A PlayStation-type controller from the client is emulated as a full DualSense (DS5),
+      // not a DualShock 4, so adaptive triggers / lightbar / motion survive the round-trip.
+      // This makes "auto" mode usable as the client-driven type switch: the client reports
+      // LI_CTYPE_PS for DualSense and LI_CTYPE_XBOX when the user picks Xbox in the overlay.
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be DualSense 5 controller (auto-selected by client-reported type)"sv;
+      selectedGamepadType = DualSense5Wired;
     } else if (metadata.type == LI_CTYPE_XBOX) {
       BOOST_LOG(info) << "Gamepad " << id.globalIndex << " will be Xbox 360 controller (auto-selected by client-reported type)"sv;
       selectedGamepadType = Xbox360Wired;
@@ -1670,8 +1849,9 @@ namespace platf {
     report.bThumbLY = to_ds4_triggerY(gamepad_state.lsY);
     report.bThumbRX = to_ds4_triggerX(gamepad_state.rsX);
     report.bThumbRY = to_ds4_triggerY(gamepad_state.rsY);
-
-    report.bSeqNumber++;
+    // Sequence number is bumped in ds5_update_ts_and_send (every push), so motion
+    // and the 100 ms keepalive also advance it — a real DS5 never repeats the
+    // counter, and games that watch it for continuity stuttered on duplicates.
   }
 
   /**
@@ -1687,18 +1867,31 @@ namespace platf {
       gamepad.repeat_task = nullptr;
     }
 
-    if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
+    // Only the gamepad that owns the single virtual DS5 may push. A phantom/standby
+    // DS5 context would otherwise inject a neutral (L2=0) report every 100 ms via its
+    // own keepalive — the periodic "held-trigger springs back" stutter. Returning here
+    // (without rescheduling) also lets the non-owner's keepalive chain die out.
+    if (vigem->ds5_gamepad_nr != nr) {
+      return;
+    }
+
+    if (vigem->ds5_server && vigem->ds5_server->is_running()) {
       auto now = std::chrono::steady_clock::now();
       auto delta_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - gamepad.last_report_ts);
 
       // DualSense sensor timestamp ticks at 0.33µs per LSB (3 MHz). 1 ns = 1/333.33 ticks.
       gamepad.report.ds5.Report.dwSensorTimestamp += (uint32_t) (delta_ns.count() * 3 / 1000);
+      // Advance the report counter on EVERY push (input / motion / keepalive) so it
+      // never repeats — matches a real DS5 and fixes held-button stutter.
+      gamepad.report.ds5.Report.bSeqNumber++;
 
-      auto status = vigem_target_ds5_update_ex(vigem->client.get(), gamepad.gp.get(), gamepad.report.ds5);
-      if (!VIGEM_SUCCESS(status)) {
-        BOOST_LOG(warning) << "Couldn't send DS5 gamepad input to ViGEm ["sv << util::hex(status).to_string_view() << ']';
-        return;
-      }
+      // Serialize to the 64-byte game-facing input report: [report-ID 0x01][63B body].
+      // DS5_REPORT_EX.ReportBuffer is exactly that 63-byte body (Common.h). The
+      // embedded USB/IP server delivers it on the next interrupt-IN to the game.
+      uint8_t report[ds5usbip::INPUT_REPORT_LEN];
+      report[0] = 0x01;  // DualSense USB input report-ID
+      memcpy(&report[1], gamepad.report.ds5.ReportBuffer, ds5usbip::INPUT_REPORT_LEN - 1);
+      vigem->ds5_server->set_input(report);
 
       gamepad.last_report_ts = now;
       gamepad.repeat_task = task_pool.pushDelayed(ds5_update_ts_and_send, 100ms, vigem, nr).task_id;
@@ -1720,12 +1913,13 @@ namespace platf {
     }
 
     auto &gamepad = vigem->gamepads[nr];
-    if (!gamepad.gp) {
+    // DS5 is backed by ds5vhid (gp is null); let it through and dispatch on type.
+    if (!gamepad.gp && gamepad.type != DualSense5Wired) {
       return;
     }
 
     VIGEM_ERROR status;
-    auto target_type = vigem_target_get_type(gamepad.gp.get());
+    auto target_type = gamepad.type;
 
     if (target_type == Xbox360Wired) {
       x360_update_state(gamepad, gamepad_state);
@@ -1734,6 +1928,10 @@ namespace platf {
         BOOST_LOG(warning) << "Couldn't send gamepad input to ViGEm ["sv << util::hex(status).to_string_view() << ']';
       }
     } else if (target_type == DualSense5Wired) {
+      // We back only ONE virtual DS5 device, but a client may present several DS5
+      // gamepad slots (e.g. a standby/phantom). Real input claims ownership so the
+      // active controller — not an idle phantom — drives the single vHID.
+      vigem->ds5_gamepad_nr = nr;
       ds5_update_state(gamepad, gamepad_state);
       ds5_update_ts_and_send(vigem, nr);
     } else {
@@ -1862,11 +2060,11 @@ namespace platf {
     }
 
     auto &gamepad = vigem->gamepads[motion.id.globalIndex];
-    if (!gamepad.gp) {
+    if (!gamepad.gp && gamepad.type != DualSense5Wired) {
       return;
     }
 
-    auto target_type = vigem_target_get_type(gamepad.gp.get());
+    auto target_type = gamepad.type;
     if (target_type == DualShock4Wired) {
       ds4_update_motion(gamepad, motion.motionType, motion.x, motion.y, motion.z);
       ds4_update_ts_and_send(vigem, motion.id.globalIndex);
