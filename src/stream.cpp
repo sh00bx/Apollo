@@ -1126,6 +1126,14 @@ namespace stream {
     // termination when we shut down.
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
+
+    // Poll interval for the control loop below. This bounds how long a queued
+    // gamepad feedback message (rumble / adaptive triggers / RGB led) waits before
+    // it is drained and sent, because enet_host_service() blocks up to this long
+    // between drains. Kept small: this thread only runs during an active stream
+    // and the per-iteration work is cheap, so the extra wakeups are negligible
+    // while worst-case output-feedback latency drops from ~150ms to single digits.
+    constexpr auto control_loop_timeout = 5ms;
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
 
@@ -1195,7 +1203,7 @@ namespace stream {
         break;
       }
 
-      server->iterate(150ms);
+      server->iterate(control_loop_timeout);
     }
 
     // Let all remaining connections know the server is shutting down
